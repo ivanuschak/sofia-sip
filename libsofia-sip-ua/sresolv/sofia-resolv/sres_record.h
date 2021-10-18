@@ -74,6 +74,7 @@ enum sres_status {
   SRES_RECORD_ERR = 33,	        /**< Name has no given record type */
   SRES_INTERNAL_ERR = 34,	/**< Internal error */
   SRES_NETWORK_ERR = 35,	/**< Network or DNS configuration error. */
+  SRES_TRUNCATED_MSG_ERR = 36,	/**< Truncated message was received. */
 
   _SRES_LAST_ERR
 };

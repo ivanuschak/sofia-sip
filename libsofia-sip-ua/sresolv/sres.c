@@ -328,6 +328,8 @@ struct sres_query_s {
   uint8_t         q_n_subs;
   sres_query_t   *q_subqueries[1 + SRES_MAX_SEARCH];
   sres_record_t **q_subanswers[1 + SRES_MAX_SEARCH];
+  uint8_t         q_query_data[2048];
+  uint16_t        q_query_data_size;
 };
 
 
@@ -345,7 +347,7 @@ struct sres_message {
       uint16_t mh_nscount;	/* Authority records count */
       uint16_t mh_arcount;	/* Additional records count */
     } mp_header;
-    uint8_t mp_data[1500 - 40];	/**< IPv6 datagram */
+    uint8_t mp_data[/*1500 - 40*/8192];	/**< IPv6 datagram */
   } m_packet;
 #define m_id      m_packet.mp_header.mh_id
 #define m_flags   m_packet.mp_header.mh_flags
@@ -444,6 +446,9 @@ static int sres_servers_count(sres_server_t * const *servers);
 
 static sres_socket_t sres_server_socket(sres_resolver_t *res,
 					sres_server_t *dns);
+
+static sres_socket_t sres_tcp_client_socket(sres_resolver_t *res,
+                    sres_server_t *dns);
 
 static sres_query_t * sres_query_alloc(sres_resolver_t *res,
 				       sres_answer_f *callback,
@@ -1587,6 +1592,7 @@ char const *sres_record_status(int status, char buffer[8])
   case SRES_RECORD_ERR: return "RECORD_ERR";
   case SRES_INTERNAL_ERR: return "INTERNAL_ERR";
   case SRES_NETWORK_ERR: return "NETWORK_ERR";
+  case SRES_TRUNCATED_MSG_ERR: return "TRUNCATED_MSG_ERR";
 
   default:
     if (buffer)
@@ -2717,6 +2723,106 @@ sres_socket_t sres_server_socket(sres_resolver_t *res, sres_server_t *dns)
   return s;
 }
 
+static
+sres_socket_t sres_tcp_client_socket(sres_resolver_t *res, sres_server_t *dns)
+{
+  int family = dns->dns_addr->ss_family;
+  sres_socket_t s;
+  int mode;
+
+  s = socket(family, SOCK_STREAM, IPPROTO_TCP);
+  if (s == -1) {
+    SU_DEBUG_1(("%s: %s: %s\n", "sres_tcp_client_socket", "socket",
+        su_strerror(su_errno())));
+    return s;
+  }
+
+#if HAVE_IP_RECVERR
+  if (family == AF_INET || family == AF_INET6) {
+    int const one = 1;
+    if (setsockopt(s, SOL_IP, IP_RECVERR, &one, sizeof(one)) < 0) {
+      if (family == AF_INET)
+    SU_DEBUG_3(("setsockopt(IPVRECVERR): %s\n", su_strerror(su_errno())));
+    }
+  }
+#endif
+#if HAVE_IPV6_RECVERR
+  if (family == AF_INET6) {
+    int const one = 1;
+    if (setsockopt(s, SOL_IPV6, IPV6_RECVERR, &one, sizeof(one)) < 0)
+      SU_DEBUG_3(("setsockopt(IPV6_RECVERR): %s\n", su_strerror(su_errno())));
+  }
+#endif
+
+  if (connect(s, (void *)dns->dns_addr, dns->dns_addrlen) < 0) {
+    char ipaddr[64];
+    char const *lb = "", *rb = "";
+
+    if (family == AF_INET) {
+      void *addr = &((struct sockaddr_in *)dns->dns_addr)->sin_addr;
+      su_inet_ntop(family, addr, ipaddr, sizeof ipaddr);
+    }
+#if HAVE_SIN6
+    else if (family == AF_INET6) {
+      void *addr = &((struct sockaddr_in6 *)dns->dns_addr)->sin6_addr;
+      su_inet_ntop(family, addr, ipaddr, sizeof ipaddr);
+      lb = "[", rb = "]";
+    }
+#endif
+    else
+      snprintf(ipaddr, sizeof ipaddr, "<af=%u>", family);
+
+    SU_DEBUG_1(("%s: %s: %s: %s%s%s:%u\n", "sres_tcp_client_socket", "connect",
+        su_strerror(su_errno()), lb, ipaddr, rb,
+        ntohs(((struct sockaddr_in *)dns->dns_addr)->sin_port)));
+    sres_close(s);
+    return INVALID_SOCKET;
+  }
+
+  SU_DEBUG_1(("%s: %s: errno %s\n", "sres_tcp_client_socket", "socket",
+      su_strerror(su_errno())));
+
+  {
+      char ipaddr[64];
+      char const *lb = "", *rb = "";
+
+      if (family == AF_INET) {
+        void *addr = &((struct sockaddr_in *)dns->dns_addr)->sin_addr;
+        su_inet_ntop(family, addr, ipaddr, sizeof ipaddr);
+      }
+  #if HAVE_SIN6
+      else if (family == AF_INET6) {
+        void *addr = &((struct sockaddr_in6 *)dns->dns_addr)->sin6_addr;
+        su_inet_ntop(family, addr, ipaddr, sizeof ipaddr);
+        lb = "[", rb = "]";
+      }
+  #endif
+      else
+        snprintf(ipaddr, sizeof ipaddr, "<af=%u>", family);
+
+      SU_DEBUG_1(("%s: %s: %s: %s%s%s:%u\n", "sres_tcp_client_socket", "connect",
+          su_strerror(su_errno()), lb, ipaddr, rb,
+          ntohs(((struct sockaddr_in *)dns->dns_addr)->sin_port)));
+  }
+
+  SU_DEBUG_1(("%s: %s: errno %s\n", "sres_tcp_client_socket", "socket",
+      su_strerror(su_errno())));
+
+  mode = fcntl(s, F_GETFL, 0);
+  if (mode < 0) {
+    SU_DEBUG_1(("%s: fcntl error %d", "sres_server_socket", mode));
+    //TODO: return invalid socket
+  }
+
+  mode |= O_NDELAY | O_NONBLOCK;
+  if (fcntl(s, F_SETFL, mode) < 0) {
+    SU_DEBUG_1(("%s: fcntl error %d", "sres_server_socket", mode));
+    //TODO: return invalid socket
+  }
+
+  return s;
+}
+
 /* ---------------------------------------------------------------------- */
 
 /** Send a query packet */
@@ -2791,12 +2897,19 @@ sres_send_dns_query(sres_resolver_t *res,
     dns = sres_next_server(res, &q->q_i_server, 1), i = q->q_i_server;
 
   for (; dns; dns = sres_next_server(res, &i, 1)) {
+    uint8_t *p;
     /* If server supports EDNS, include EDNS0 record */
     q->q_edns = dns->dns_edns;
     /* 0 (no EDNS) or 1 (EDNS supported) additional data records */
     m->m_arcount = htons(q->q_edns != 0);
     /* Size with or without EDNS record */
     size = q->q_edns ? edns_size : no_edns_size;
+
+    q->q_query_data_size = size + sizeof(uint16_t);
+    p = q->q_query_data;
+    p[0] = size >> 8;
+    p[1] = (uint8_t)size;
+    memcpy(&p[2], m->m_data, 1440);
 
     s = sres_server_socket(res, dns);
 
@@ -3512,6 +3625,141 @@ sres_resolver_receive(sres_resolver_t *res, int socket)
     sres_send_dns_query(res, query);
     query->q_retry_count++;
   }
+  else if (error == SRES_TRUNCATED_MSG_ERR) {
+      uint8_t resp[8192] = {0};
+      ssize_t size = 0;
+      uint16_t expected_size = 0;
+      int attempts_count = 12;
+      do {
+          int s = sres_tcp_client_socket(res, dns);
+          int first_reply = 1;
+          int done = 0;
+          int i;
+          char buf[4096] = {0};
+          SU_DEBUG_5(("%s: socket: %d\n", "sres_resolver_receive", s));
+
+          if (s == INVALID_SOCKET) {
+            SU_DEBUG_5(("%s: invalid socket\n", "sres_resolver_receive"));
+            break;
+          }
+
+          SU_DEBUG_5(("%s: query_data_size: %d\n", "sres_resolver_receive", query->q_query_data_size));
+
+          for (i=0; i < num_bytes; ++i) {
+            sprintf(buf, "%s%.2X ", buf, query->q_query_data[i]);
+          }
+
+          SU_DEBUG_7(("%s: bytes buf: %s\n", "sres_resolver_receive", buf));
+
+          /* Send the DNS message via the UDP socket */
+          if (send(s, query->q_query_data, query->q_query_data_size, 0) != query->q_query_data_size) {
+            error = su_errno();
+            SU_DEBUG_5(("%s: error %d\n", "sres_resolver_receive", error));
+            done = 1;
+            sres_close(s);
+            break;
+          }
+
+
+          while (attempts_count--) {
+            int n;
+            fd_set readfds[1];
+            struct timeval timeval[1];
+
+            FD_ZERO(readfds);
+
+            timeval->tv_sec = 0;
+            timeval->tv_usec = 500000;
+
+            FD_SET(s, readfds);
+            n = s + 1;
+
+            n = select(s + 1, readfds, NULL, NULL, timeval);
+
+            if (n < 0) {
+              SU_DEBUG_5(("sres_resolver_receive: error n=%d\n", n));
+              done = 1;
+              break;
+            }
+            else if (n == 0) {
+              SU_DEBUG_7(("%s: select returned 0\n", "sres_resolver_receive"));
+              continue;
+            }
+            else {
+                num_bytes = recv(s, &resp[size], sizeof(resp) - size, 0);
+                if (num_bytes <= 0) {
+                    size = 0;
+                    done = 1;
+                    SU_DEBUG_3(("%s: recv error, error=%d\n", "sres_resolver_receive", num_bytes));
+                    break;
+                }
+
+                size += num_bytes;
+                SU_DEBUG_9(("%s: size=%d\n", "sres_resolver_receive", size));
+                SU_DEBUG_9(("%s: num_bytes=%d\n", "sres_resolver_receive", num_bytes));
+
+                if (first_reply) {
+                    uint16_t tmp;
+                    memcpy(&tmp, resp, sizeof(uint16_t));
+                    expected_size = ntohs(tmp);
+
+                    SU_DEBUG_9(("%s: first reply num_bytes %d\n", "sres_resolver_receive", num_bytes));
+                    SU_DEBUG_9(("%s: first reply size %d\n", "sres_resolver_receive", expected_size));
+
+                    first_reply = 0;
+                }
+
+                SU_DEBUG_9(("%s: expected_size=%d\n", "sres_resolver_receive", expected_size + sizeof(uint16_t)));
+                SU_DEBUG_9(("%s: size=%d\n", "sres_resolver_receive", size));
+
+                if (expected_size + sizeof(uint16_t) == size) {
+                    done = 1;
+                    break;
+                }
+            }
+          }
+
+          if (size && done) {
+              memset(m, 0, offsetof(sres_message_t, m_data));
+              m->m_size = (uint16_t)expected_size;
+              memcpy(m->m_data, &resp[sizeof(uint16_t)], sizeof(resp) - sizeof(uint16_t));
+
+              /* Decode the received message and get the matching query object */
+              error = sres_decode_msg(res, m, &query, &reply);
+              SU_DEBUG_1(("%s: sres_decode_msg error %d\n", "sres_resolver_receive", error));
+              sres_log_response(res, m, from, query, reply);
+          }
+          sres_close(s);
+
+      } while(0);
+
+      /* Remove the query from the pending list */
+      sres_remove_query(res, query, 1);
+
+      /* Resolve the CNAME alias, if necessary */
+      if (query->q_type != sres_type_cname && query->q_type != sres_qtype_any &&
+          reply[0] && reply[0]->sr_type == sres_type_cname) {
+        const char *alias = reply[0]->sr_cname[0].cn_cname;
+        sres_record_t **cached = NULL;
+
+        /* Check for the aliased results in the cache */
+        if (sres_cache_get(res->res_cache, query->q_type, alias, &cached)
+            > 0) {
+          reply = cached;
+        }
+        else {
+          /* Submit a query with the aliased name, dropping this result */
+          sres_resolve_cname(res, query, alias);
+          return 1;
+        }
+      }
+
+      /* Notify the listener */
+      if (query->q_callback != NULL)
+        (query->q_callback)(query->q_context, query, reply);
+
+      sres_free_query(res, query);
+  }
   else if (!error && reply) {
     /* Remove the query from the pending list */
     sres_remove_query(res, query, 1);
@@ -3541,6 +3789,7 @@ sres_resolver_receive(sres_resolver_t *res, int socket)
     sres_free_query(res, query);
   }
   else {
+    SU_DEBUG_1(("%s: error %s\n", "sres_resolver_receive", su_strerror(su_errno())));
     sres_query_report_error(query, reply);
   }
 
@@ -3668,7 +3917,11 @@ sres_decode_msg(sres_resolver_t *res,
     return -1;
   }
 
-  err = m->m_flags & SRES_HDR_RCODE;
+  err = SRES_HDR_RCODE;
+  if (m->m_flags & SRES_HDR_TC) {
+    SU_DEBUG_3(("sres_decode_msg: Truncated message received\n" VA_NONE));
+    err = SRES_TRUNCATED_MSG_ERR;
+  }
 
   if (m->m_ancount == 0 && err == 0)
     err = SRES_RECORD_ERR;
